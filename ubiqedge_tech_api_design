@@ -1,0 +1,163 @@
+ubiqedge — API design (finalized)
+
+1. design principles ->
+  1. resource oriented endpoints
+  2. three separate prefixes, each independently versioned — they evolve separately
+       and have different auth schemes (see below):
+       /api/v1/...       backend, JWT auth
+       /ingest/v1/...     telemetry ingestion, device/org API-key auth
+       /payments/v1/...   payment gateway webhook ingress, signature auth
+  3. URI versioning
+  4. multi-row writes (invoice batch generation, account+user creation, payment
+     webhook -> invoice update + payment_transaction insert) wrapped in DB transactions
+  5. clearly defined request/response DTOs, validated via class-validator
+       global ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })
+  6. graceful error handling, verbose structured logging (considering evolvability)
+       error shape: { statusCode, message, error, path, timestamp } via a global exception filter
+  7. three distinct guard strategies (not one blanket JWT guard):
+       - JwtAuthGuard + RolesGuard (@Roles('Admin'|'Customer')) on /api/v1
+       - ApiKeyGuard on /ingest/v1 (org or device-level secret)
+       - SignatureGuard on /payments/v1/webhook (provider signs the payload)
+  8. every /api/v1 list/detail query is scoped by orgId (+ ownership for Customer
+     role) inside the service layer — never trust a client-supplied orgId/userId
+  9. pagination: ?page=&limit= (default 20, max 100) -> { data: [], meta: { page, limit, total } }
+     time-window filters: ?from=<ISO>&to=<ISO>
+  10. response DTOs sized deliberately per screen, balancing over-fetching
+      against chattiness — decided case by case against an actual frontend
+      need, not by default either way:
+        - GET /devices/:id must NOT inline full telemetry history (could be
+          thousands of rows) — that stays behind the dedicated, paginated
+          /devices/:id/telemetry endpoint
+        - GET /accounts/me/devices (list screen) SHOULD embed a small
+          denormalized summary per device — lastReadingValue, lastReadingAt —
+          computed server-side via one query, rather than returning bare
+          device rows and forcing the UI into N follow-up calls (one per
+          device) just to show "current reading" on a list
+      rule of thumb: embed only what the specific screen the endpoint serves
+      actually renders; anything unbounded (history, logs) stays a separate
+      paginated endpoint
+  11. Swagger/OpenAPI docs — nice to have, not required. NestJS's
+      @nestjs/swagger generates it from the same DTOs already required by
+      principle #5 (class-validator decorators are largely inferable via the
+      swagger CLI plugin, so this doesn't mean duplicating every field with
+      @ApiProperty()). Mounted at /api/docs on the backend, excluded from
+      JwtAuthGuard; skip on ingestion-service given its single endpoint.
+
+--------------------------------------------------------------------------
+
+2. ingestion api  ( device -> server, 5 min cadence )
+
+  POST /ingest/v1/:orgCode/:deviceType/:serialNo
+  headers:
+    X-Api-Key: <org or device secret>
+
+  body:
+  {
+    "deviceTimestamp": "2026-08-11T10:05:00Z",
+    "readings": [
+      { "paramKey": "TOTAL", "value": 12345.6 },
+      { "paramKey": "FLOW", "value": 2.3 }
+    ]
+  }
+  ( tank payload: readings: [{ paramKey: "LEVEL", value: 78.2 }] )
+
+  response: 202 { accepted: true }
+
+  notes:
+    - deviceType/serialNo resolve to a device row; paramKey must belong to that
+      device's deviceTypeId (device_type_param), else 422.
+    - idempotent per (orgId, deviceId, deviceTypeParamId, deviceTimestamp) — the
+      device_telemetry unique constraint absorbs retried/duplicate deliveries;
+      catch the duplicate-key error and still return 202, don't 500 on retry.
+    - deviceTimestamp missing/invalid -> 400 (graceful invalid-input handling, per constraint #1)
+    - a device with connectionId still NULL (added to inventory, not yet
+      linked to a customer account — see data model, device.connectionId is
+      nullable) must NOT have its readings persisted to device_telemetry.
+      Reject with 409 { message: "device is not linked to a customer account" }
+      — not a silent 202 — so it's visible during testing/demo, not a quiet
+      data gap discovered later at invoicing time.
+    - once connectionId IS set, ingestion proceeds regardless of the linked
+      customer_connection's status (ACTIVE or SUSPENDED) — a suspended
+      (non-paying) account still gets its consumption metered, only the
+      physical supply cutoff (relay, stretch feature) affects flow, not
+      whether we record it
+
+--------------------------------------------------------------------------
+
+3. backend apis   ( prefix: /api/v1 )
+
+  auth
+    POST /auth/login                        { email, password } -> { accessToken }
+    ( no self-signup — Admin creates all users, per FR )
+
+  users
+    POST   /users                           Admin  — create user (Customer or Admin)
+    GET    /users                           Admin  — list, paginated, filter by role
+    GET    /users/me                        any    — own profile
+    GET    /users/:id                       Admin
+    PATCH  /users/:id                       Admin
+    DELETE /users/:id                       Admin  — soft delete
+
+  accounts   ( = customer_connection, the user:account 1:1 entity )
+    POST   /accounts                        Admin  — create, link userId
+    GET    /accounts                        Admin  — list, paginated, searchable, ?userId= exact-match filter
+                                                       (added while building the frontend's /admin/accounts and
+                                                       /admin/users pages — originally missing)
+    GET    /accounts/:id                    Admin
+    GET    /accounts/me                     Customer — own account
+    PATCH  /accounts/:id/status             Admin  — ACTIVE/SUSPENDED (ties into supply-cutoff, stretch)
+
+  devices   ( meters + tanks )
+    POST   /devices                         Admin  — create; connectionId optional (can add before assigning)
+    GET    /devices                         Admin  — list, filter by connectionId/deviceTypeId/unassigned
+    GET    /devices/:id                     Admin or owning Customer
+    PATCH  /devices/:id                     Admin  — rename/deactivate/assign connectionId
+    DELETE /devices/:id                     Admin  — soft delete
+    GET    /devices/:id/telemetry           Admin or owning Customer — consumption view
+             ?from=&to=&paramKey=&page=&limit=        (req #4: view consumption over a time window)
+    GET    /accounts/me/devices             Customer — own meters/tanks
+
+  device-types
+    GET    /device-types                    any authenticated  ( mostly seed data )
+
+  pricing
+    POST   /pricing-configs                 Admin  — FIXED or SLAB, effectiveFrom
+             (creating a new config auto-closes the previous one's effectiveTo)
+    GET    /pricing-configs                 Admin  — list, filter by deviceTypeId
+    GET    /pricing-configs/active          Admin  — ?deviceTypeId= currently active config
+
+  invoices
+    POST   /invoices/generate               Admin  — trigger batch generation for previous month
+             (admin-triggered only — no background schedule, per FR: "Admin can
+              generate invoices for all meters for previous month". Safe to call
+              more than once: idempotent via the customer_invoice
+              unique(deviceId, billingPeriodStart, billingPeriodEnd) constraint)
+    GET    /invoices                        Admin  — list all, filter deviceId/status/period
+    GET    /invoices/:id                    Admin or owning Customer
+    PATCH  /invoices/:id/cancel             Admin  — mark CANCELLED (correction flow)
+    GET    /accounts/me/invoices            Customer — current + previous invoices (req #5)
+
+  payments   ( appreciated #2 )
+    POST   /invoices/:id/pay                Customer — initiate payment session w/ gateway
+    GET    /invoices/:id/payments           Admin or owning Customer — payment attempt log
+
+--------------------------------------------------------------------------
+
+4. payment webhook ingress   ( appreciated #2, prefix: /payments/v1 )
+
+  POST /payments/v1/webhook/:provider
+  ( no JWT — verified via provider's signature header, not an /api/v1 route )
+  effect: insert payment_transaction row, and on SUCCESS mark the invoice PAID
+  inside one DB transaction.
+
+--------------------------------------------------------------------------
+
+5. STRETCH — only after required scope is solid
+
+  device commands  ( appreciated #6, relay-based supply cutoff )
+    POST /api/v1/devices/:id/commands       Admin  — issue SUPPLY_ON / SUPPLY_OFF
+    GET  /api/v1/devices/:id/commands       Admin
+
+  webhook egress subscriptions  ( appreciated #4 )
+    POST /api/v1/webhook-subscriptions      Admin
+    GET  /api/v1/webhook-subscriptions      Admin

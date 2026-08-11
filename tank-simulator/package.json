@@ -1,0 +1,15 @@
+{
+  "name": "tank-simulator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mocks a level-sensor tank — POSTs LEVEL readings to ingestion-service on a timer",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "mysql2": "^3.12.0"
+  }
+}

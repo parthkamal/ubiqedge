@@ -1,0 +1,61 @@
+Problem Statement : 
+1. design and implement an On-premise IOT solution for Water Billing where: 
+
+  1. Users can log into the system (Roles : Admin and Customer)
+  2. Admin can add water meters
+  3. Customer shall have one or more meters assigned to his/her account/connection. ( user-account(1:1 ) account-meter(1:M))
+  4. Admin can generate invoices for all meters for previous month. 
+  5. Customer can view current and previous invoices
+
+
+Required Functionality : 
+  1. Authentication Mechanism 
+  2. Create a water meter
+  3. Create a User
+  4. view consumption info ( which time window )
+  5. data ingestion mechanism for water meter data. ( rest api) , 
+    frequency of calling is 5 min
+      for water meter -> 2 parameters : TOTAL , FLOW ( instantaneous_value  ) 
+      for tank -> 1 parameter : LEVEL 
+  6. Generate Previous month invoices: 
+    Invoice shall be based on a fixed per unit pricing or slab based , configurable by admin. 
+
+
+Appreciated Functionality : 
+  1. validation and meaningful error messages; 
+  2. payment gateway integration with logs ( customer role )
+  3. multiple data ingestion mechanisms
+  4. webhook based data egress for third party integrations 
+  5. add water tanks ( level sensor based )
+  6. ability to cut off supply based on non-payment ( relay-based value )
+  7. soft deletes ( that makes sense )
+  8. unit tests
+
+constraints and expectations : 
+
+  1. invalid input graceful handling. 
+  2. your solution should be runnable locally. 
+
+
+Deliverables : 
+
+  1. Source Code ( public git repo)
+  2. Provide a recommendation for infrastructure setup ( both hardware and software ), include options for: 
+    1. smallscale ( 50 meters)
+    2. medium scale ( 300 meters)
+    3. large scale (300+ meters)
+  3. a Readme.md that includes : 
+    1. how to run the projects
+    2. database schema explaination ( diagram optional )
+    3. key design decisions and assumptions
+    4. what you would improve with more time. 
+
+
+Notes : 
+  1. Reasonable assumptions are encouraged - just document them 
+  2. Third-Party libraries and tools are appreciated , especially if they improve the solution / experience
+  3. You may ask for clarity on the assignment whereven required
+  4. It is advised to be aware of and to use best-practice for relevant stack used. 
+
+
+

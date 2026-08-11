@@ -1,0 +1,264 @@
+ubiqedge — data model (finalized)
+
+Decisions locked in:
+  - multi-tenant (orgId denorm kept everywhere)
+  - slab pricing stored as config + slab tiers, invoice stores blended effective rate + amount
+  - device.connectionId nullable — meter can be added to inventory before being linked to a customer account
+
+--------------------------------------------------------------------------
+
+organization
+  cols:
+    id : string PK  ( human-readable code, e.g. "ORG01" — this IS orgCode used in ingestion URI )
+    name : string not null
+    apiKeySecretHash : string nullable  ( SHA-256 hex digest of the org's ingestion API key —
+      SHA-256 not bcrypt: the key is a high-entropy random secret, not a user-chosen password,
+      so slow hashing buys no brute-force resistance and only costs latency on every
+      ingest call. Checked in ingestion-service's ApiKeyGuard via timing-safe compare. )
+    isActive : tinyint default 1
+    createdAt : datetime not null
+    updatedAt : datetime default null
+
+
+role
+  cols:
+    id : int PK
+    type : enum ( Customer / Admin ) not null
+    displayName : string not null
+    orgId : string FK ref ( organization )
+
+  constraint :
+    uniq : ( type, orgId )
+
+
+user
+  cols:
+    id : int PK
+    firstName : string not null
+    lastName : string default null
+    isActive : tinyint default 1
+    email : string not null ( validation, globally unique — not per org, see constraint note )
+    phoneNumber : string not null ( validation )
+    passwordHash : string not null
+    address : string not null
+    pincode : string not null
+    orgId : string FK ref ( organization ) ( denorm )
+    roleId : int FK ref ( role ) ( M:1 )
+    createdAt : datetime not null
+    updatedAt : datetime default null
+    deletedAt : datetime default null  ( soft delete )
+
+  constraint :
+    uniq : ( email )
+      -- global, not per-org: POST /auth/login takes only { email, password },
+      -- no orgCode, so email must unambiguously resolve to one user across
+      -- all orgs or login can't pick between two same-email users in
+      -- different orgs. (email, orgId) was the original constraint before
+      -- the login contract was worked out — corrected here.
+
+  note: removed `serialNo` from user — was a leftover, the actual customer-facing
+  identifier is customer_connection.accountNo below.
+
+
+customer_connection   ( = "account" in the FR — user:account is 1:1 )
+  cols:
+    id : int PK
+    accountNo : string not null ( auto-generated, customer-facing account number )
+    userId : int FK ref ( user ) not null
+    status : enum ( ACTIVE / SUSPENDED ) not null default ACTIVE
+      ( SUSPENDED = supply cutoff applied for non-payment — appreciated feature #6 )
+    orgId : string FK ref ( organization ) not null ( denorm )
+    createdAt : datetime not null
+    updatedAt : datetime default null
+    deletedAt : datetime default null
+
+  constraint :
+    uniq : ( userId )                 -- enforces 1:1 user:account
+    uniq : ( accountNo, orgId )
+
+
+device_type
+  cols:
+    id : int PK
+    type : enum ( TANK | METER )
+    billed : tinyint not null default 0   -- METER=1, TANK=0 (answers open Q1: flag, not hardcoded)
+    orgId : string FK ref ( organization )
+
+  constraint :
+    uniq : ( type, orgId )
+
+
+device_type_param
+  cols:
+    id : int PK
+    deviceTypeId : int FK ref ( device_type ) not null
+    paramKey : enum ( LEVEL, TOTAL, FLOW ) not null   -- RATE removed: billing rate is not a telemetry param, see pricing_config
+    displayName : string not null
+    dataType : enum ( numeric ) not null
+    orgId : string FK ref ( organization ) ( denorm )
+
+  constraint :
+    uniq : ( paramKey, orgId )
+    paramKey is immutable.
+
+
+device   ( meter or tank )
+  cols:
+    id : int PK
+    name : string not null
+    serialNo : string not null ( auto-generated )
+    deviceTypeId : int FK ref ( device_type ) not null
+    connectionId : int FK ref ( customer_connection ) NULLABLE ( M:1 )
+      -- nullable: admin can add a meter to inventory before it's linked to a customer account
+    isActive : tinyint default 1
+    orgId : string FK ref ( organization ) not null ( denorm )
+    createdAt : datetime not null
+    updatedAt : datetime default null
+    deletedAt : datetime default null
+
+  constraint :
+    uniq : ( serialNo, orgId )
+
+
+device_telemetry
+  cols:
+    id : BIGINT PK
+    deviceId : int FK ref ( device ) not null
+    deviceTypeId : int FK ref ( device_type ) not null ( denorm )
+    deviceTypeParamId : int FK ref ( device_type_param ) not null
+    value : decimal not null
+    serverTimestamp : datetime not null   ( set by ingestion service = receipt time )
+    deviceTimestamp : datetime not null   ( from payload = actual reading time )
+    orgId : string FK ref ( organization ) not null ( denorm )
+
+  constraint :
+    uniq : ( orgId, deviceId, deviceTypeParamId, deviceTimestamp )
+    -- reordered from original (orgId now leads) so the same index serves
+    -- tenant-scoped time-window scans for the consumption view (req #4)
+
+
+pricing_config
+  cols:
+    id : int PK
+    deviceTypeId : int FK ref ( device_type ) not null   -- billed=true type only (meter)
+    rateType : enum ( FIXED, SLAB ) not null
+    fixedRate : decimal nullable        ( used when rateType = FIXED )
+    effectiveFrom : datetime not null
+    effectiveTo : datetime nullable     ( null = currently active config )
+    orgId : string FK ref ( organization ) not null
+    createdAt : datetime not null
+    updatedAt : datetime default null
+
+  note: effective-date ranges for the same (orgId, deviceTypeId) must not overlap
+  — enforced at the application layer, not a DB constraint.
+
+  index : ( deviceTypeId, orgId, effectiveTo ) — the "find the active config"
+  lookup (effectiveTo IS NULL), hit on every /pricing-configs/active call and
+  once per device inside every invoice-generation batch loop.
+
+
+pricing_slab   ( children of a pricing_config where rateType = SLAB )
+  cols:
+    id : int PK
+    pricingConfigId : int FK ref ( pricing_config ) not null
+    slabFrom : decimal not null      ( inclusive lower bound, consumption units )
+    slabTo : decimal nullable        ( null = unbounded, i.e. last tier )
+    rate : decimal not null          ( per-unit rate for this tier )
+
+  constraint :
+    uniq : ( pricingConfigId, slabFrom )
+
+
+customer_invoice   ( meter level, one row per device per billing period )
+  cols:
+    id : int PK
+    serialNo : string not null ( auto-gen, invoice number )
+    deviceId : int FK ref ( device ) not null
+    billingPeriodStart : date not null
+    billingPeriodEnd : date not null
+    openingCheckpointId : BIGINT FK ref ( device_telemetry ) not null
+      ( = closingCheckpointId of this device's last non-CANCELLED invoice,
+        or earliest available reading if no prior invoice exists — see note below )
+    closingCheckpointId : BIGINT FK ref ( device_telemetry ) not null
+      ( latest TOTAL reading at/before period end, at generation time )
+    openingReading : decimal not null   ( copied from openingCheckpoint.value )
+    closingReading : decimal not null   ( copied from closingCheckpoint.value )
+    consumptionUnits : decimal not null ( = closingReading - openingReading, denormalized )
+    pricingConfigId : int FK ref ( pricing_config ) not null   ( audit: which config was applied )
+    appliedUnitRate : decimal not null  ( blended effective rate actually charged )
+    amount : decimal not null           ( = consumptionUnits * appliedUnitRate, or slab-computed total )
+    status : enum ( PENDING, PAID, CANCELLED ) not null default PENDING
+      ( PENDING/PAID = webhook-based, marked PAID on successful payment.
+        CANCELLED = admin voided a bad invoice — e.g. wrong reading ingested. )
+    transactionId : string default NULL
+    transactionProvider : string default NULL
+    generatedAt : datetime not null
+    dueDate : date nullable
+    orgId : string FK ref ( organization ) ( denorm )
+    createdAt : datetime not null
+    updatedAt : datetime default null
+
+  constraint :
+    uniq : ( deviceId, billingPeriodStart, billingPeriodEnd )
+    -- prevents double-generation for the same device+period (idempotent batch job)
+
+  index : ( orgId, generatedAt ) — InvoiceService.findAll/findMine: org-scoped,
+  paginated, ORDER BY generatedAt DESC list screens (admin + customer), only
+  get more expensive as invoices accumulate month over month.
+
+  note — opening checkpoint anchor query (batch generation, per device):
+    SELECT closingCheckpointId, closingReading, billingPeriodEnd
+    FROM customer_invoice
+    WHERE deviceId = ? AND status != 'CANCELLED'
+    ORDER BY billingPeriodEnd DESC
+    LIMIT 1
+
+    - filters out CANCELLED, but NOT on PENDING vs PAID — payment status must never
+      affect consumption continuity, only whether the invoice row was actually created.
+    - if no row is found for a device (first invoice ever), fall back to the
+      earliest device_telemetry row for that device's TOTAL param.
+    - if the last invoice's billingPeriodEnd is more than one period back (a prior
+      run was skipped — e.g. no telemetry that month), billingPeriodStart for the
+      new invoice = that old billingPeriodEnd, so the invoice implicitly spans the
+      gap rather than losing or double-counting consumption. Log this case — it
+      usually means telemetry ingestion had a gap and is worth surfacing to admin.
+
+
+payment_transaction   ( appreciated #2 — payment gateway + logs )
+  cols:
+    id : int PK
+    invoiceId : int FK ref ( customer_invoice ) not null
+    provider : string not null
+    providerTransactionId : string not null
+    amount : decimal not null
+    status : enum ( INITIATED, SUCCESS, FAILED ) not null
+    rawPayload : json nullable   ( webhook payload, kept for audit )
+    orgId : string FK ref ( organization ) ( denorm )
+    createdAt : datetime not null
+
+  constraint :
+    uniq : ( provider, providerTransactionId )
+
+--------------------------------------------------------------------------
+STRETCH tables — only build if time permits, after the required scope is solid
+
+device_command   ( appreciated #6 — relay-based supply cutoff )
+  cols:
+    id : int PK
+    deviceId : int FK ref ( device ) not null
+    command : enum ( SUPPLY_ON, SUPPLY_OFF ) not null
+    status : enum ( PENDING, ACKED ) not null default PENDING
+    issuedAt : datetime not null
+    ackedAt : datetime nullable
+    orgId : string FK ref ( organization ) ( denorm )
+
+
+webhook_subscription   ( appreciated #4 — webhook egress )
+  cols:
+    id : int PK
+    eventType : enum ( INVOICE_GENERATED, PAYMENT_COMPLETED, TELEMETRY_RECEIVED )
+    targetUrl : string not null
+    secret : string not null
+    isActive : tinyint default 1
+    orgId : string FK ref ( organization ) ( denorm )
+    createdAt : datetime not null

@@ -1,0 +1,334 @@
+ubiqedge — implementation spec (draft)
+
+stack: NestJS + TypeScript + MySQL (backend, ingestion-service), React + JavaScript (frontend — plain JS, deliberately no TS on this side)
+
+--------------------------------------------------------------------------
+0. repo layout — three deployable services + two device simulators, one shared MySQL
+
+  /frontend             React + JavaScript (plain JS — TS would be overkill
+                        for a prototype frontend of this size; backend/
+                        ingestion-service keep TS since their schema-heavy,
+                        FK-laden logic benefits more from static types)
+  /backend              NestJS — everything except device telemetry ingestion
+  /ingestion-service     NestJS — the /ingest/v1 write path only
+  /meter-simulator       standalone script — mocks a physical water meter,
+                         POSTs TOTAL + FLOW readings on a timer
+  /tank-simulator        standalone script — mocks a level-sensor tank,
+                         POSTs LEVEL readings on a timer
+
+  meter-simulator and tank-simulator exist purely so the ingestion pipeline
+  is demonstrably testable end-to-end locally without real hardware — each
+  is a small Node/TS script (not a NestJS app, no framework overhead needed)
+  that reads a serialNo/orgCode/interval from env/config and periodically
+  calls POST /ingest/v1/:orgCode/:deviceType/:serialNo. Two separate
+  directories rather than one parameterized script, since the two device
+  types have different param shapes (TOTAL+FLOW vs LEVEL) and this keeps
+  each trivially readable on its own.
+
+  why split ingestion out: it's the one endpoint with a fundamentally
+  different load/scaling profile (high-frequency, unauthenticated-by-JWT,
+  no business logic beyond validate+write) — isolating it means it can be
+  scaled or hardened independently of the CRUD backend, and a bad ingestion
+  spike can't degrade the admin/customer-facing API. Both services connect to
+  the same MySQL instance/schema with their own TypeORM DataSource; only
+  `backend` owns/runs migrations, `ingestion-service` just reads/writes
+  through a minimal set of entities for the tables it touches (device,
+  device_type, device_type_param, device_telemetry, organization) —
+  duplicated entity definitions, not a shared package, to keep the two
+  services independently deployable without a monorepo build step. Documented
+  as a deliberate tradeoff in the README (a shared `libs/entities` package
+  would remove the duplication if this grew past assignment scope).
+
+
+0a. scaling & reliability posture for ingestion-service
+
+  load here is steady, not spiky (fixed device count * one call per 5 min —
+  even 300+ meters is only ~1 req/sec average), so the design goal is
+  reliability/HA, not raw throughput. Two properties make horizontal
+  replication behind an LB safe without extra coordination:
+    - stateless: no session/in-memory state in ingestion-service
+    - idempotent writes: the device_telemetry unique constraint absorbs
+      retried deliveries, so a request retried against a different replica
+      after failover can't double-count a reading (which would corrupt billing)
+  given that, replicas are sized for availability (2+ instances, so one can
+  be down/deploying without losing the write path), not for load. The LB
+  health check must actually verify DB connectivity (not just process
+  liveness), so a replica that's lost its MySQL connection gets pulled out
+  of rotation instead of silently dropping telemetry. At larger scale, MySQL
+  itself — not ingestion-service — is the real single point of failure, so
+  that's where primary/replica DB redundancy belongs; connection pool size
+  per instance must stay bounded so replica count * pool size can't exceed
+  MySQL's max_connections. Full hardware/software sizing per FR's 50/300/300+
+  meter tiers goes in the separate infra-recommendation doc (deliverable #2).
+
+
+1. backend — module breakdown ( maps 1:1 to api design resources )
+
+  ( module names are singular — UserModule not UsersModule, etc. —
+    TelemetryModule/PricingModule stay as-is since those nouns are already
+    singular/uncountable )
+
+  AuthModule            login, JWT issuance (passport-jwt), bcrypt password hashing
+  UserModule            user CRUD
+  AccountModule         customer_connection CRUD, status (ACTIVE/SUSPENDED)
+  DeviceModule          device + device_type + device_type_param CRUD
+  TelemetryModule       telemetry query only (consumption view) — GET /devices/:id/telemetry
+  PricingModule         pricing_config + pricing_slab CRUD, effective-config resolution
+  InvoiceModule         admin-triggered batch generation service, invoice CRUD
+  PaymentModule         payment session init, /payments/v1/webhook ingress, SignatureGuard
+  OrganizationModule    org bootstrap/lookup (mostly seed-driven, thin)
+  CommandModule         STRETCH — device_command (relay cutoff)
+  WebhookModule         STRETCH — outbound webhook_subscription dispatch
+
+  cross-cutting:
+    - CommonModule: global ValidationPipe, global exception filter, RolesGuard,
+      @Roles() decorator, @CurrentUser() decorator (pulls orgId/userId/role off JWT)
+    - every service method that reads/writes accepts the authenticated user's
+      orgId implicitly (from @CurrentUser()) — never from request body/params —
+      this is what actually enforces multi-tenant isolation, the guards alone don't.
+
+
+1a. API versioning — NestJS built-in versioning module, not hand-prefixed paths
+
+  - backend: app.setGlobalPrefix('api', { exclude: ['payments/(.*)'] }), then
+    app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' }).
+    Controllers just declare @Controller('users') etc — Nest resolves the
+    final route to /api/v1/users. PaymentsWebhookController is excluded from
+    the global prefix and declares its own @Controller({ path: 'payments',
+    version: '1' }) → /payments/v1/webhook/:provider
+  - ingestion-service: app.setGlobalPrefix('ingest'); same
+    app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' })
+    → /ingest/v1/:orgCode/:deviceType/:serialNo
+  - benefit over manually prefixing every path with '/v1': a future breaking
+    change (e.g. ingestion payload shape) becomes additive —
+    @Controller({ version: '2' }) on a new controller, old routes untouched —
+    instead of a find-replace across the codebase
+
+
+2. ORM & migrations
+
+  TypeORM, chosen over Prisma for this project because:
+    - migrations are plain SQL-generatable from entities (`typeorm migration:generate`),
+      useful to hand-review given the FK-heavy schema
+    - QueryRunner gives explicit transaction control needed for invoice batch
+      generation and the payment-webhook write (insert payment_transaction +
+      update invoice.status atomically)
+
+  entities mirror ubiqedge_tech_data_model 1:1. @DeleteDateColumn() on:
+    user, customer_connection, device
+  (customer_invoice and payment_transaction are NOT soft-deletable — financial
+  records use the CANCELLED status instead, to preserve the audit trail)
+
+  all FK relations use { onDelete: 'RESTRICT' } explicitly — soft delete means
+  a hard DELETE should never silently cascade or null out a still-referenced
+  row; RESTRICT forces it to fail loudly instead.
+
+  migration workflow (adapted from the team's TypeORM migration practice):
+    - src/database/data-source.ts — standalone DataSource for the CLI, glob
+      entity discovery (`**/*.entity.ts`), separate from the Nest runtime's
+      TypeOrmModule.forRootAsync (which uses autoLoadEntities instead)
+    - synchronize is always false — migrations are the only source of truth
+      for schema changes, never auto-sync
+    - npm scripts: migration:show / migration:run / migration:revert /
+      migration:generate — all build first (`nest build`), then run the
+      typeorm CLI against compiled dist/database/data-source.js
+    - migration:generate produces one big diff file first (not committed —
+      it's a throwaway blueprint), which then gets split into small,
+      table-specific migration files (one CREATE TABLE per file, including
+      that table's own FK constraints inline, ordered by dependency) rather
+      than committing one giant migration
+    - each table-specific migration was validated with a full
+      run -> revert (all the way to empty) -> run cycle against a live MySQL
+      container before being treated as final, and the resulting schema was
+      diffed against ubiqedge_tech_data_model via SHOW CREATE TABLE — not
+      just assumed correct from the entity code
+
+
+3. auth
+
+  - passport-jwt strategy, access token only (no refresh token — out of scope
+    for this assignment's size; short-ish expiry, e.g. 8h, documented as a
+    known limitation)
+  - JwtAuthGuard + RolesGuard, applied globally via APP_GUARD in `backend`,
+    opted out with @Public() where needed (login, payment webhook)
+  - SignatureGuard (payment webhook, in `backend`): verifies provider's HMAC
+    signature header against the raw request body before it reaches the
+    controller
+  - ApiKeyGuard lives in `ingestion-service`, not backend (see section 0):
+    looks up the org by :orgCode, compares X-Api-Key against a hashed secret
+    stored on organization (add `apiKeySecretHash` column — small addition to
+    the organization table). It's the only guard that service needs — no JWT
+    strategy in ingestion-service at all.
+
+
+4. invoice generation — admin-triggered, not a background job
+
+  - per FR: "Admin can generate invoices for all meters for previous month" —
+    this is an explicit admin action (POST /invoices/generate), not an
+    automatic monthly schedule. No @nestjs/schedule / cron in this design;
+    dropped it entirely rather than keep an unused dependency around.
+  - InvoicesService.generateForPeriod(orgId, period) is the single entry
+    point the controller calls — kept as its own service method (not inlined
+    in the controller) so it's independently unit-testable, not because
+    anything else invokes it
+  - defaults to the previous calendar month if the admin doesn't specify a
+    period, but accepts an explicit period param for admin-driven backfills/reruns
+  - per device, inside one QueryRunner transaction:
+      1. resolve opening checkpoint (see ubiqedge_tech_data_model note on the
+         anchor query — last non-CANCELLED invoice, or earliest telemetry)
+      2. resolve closing checkpoint (latest TOTAL reading <= period end)
+      3. resolve active pricing_config for the device's deviceTypeId
+      4. compute consumptionUnits, appliedUnitRate, amount
+           - FIXED: amount = consumptionUnits * fixedRate
+           - SLAB: walk pricing_slab tiers, sum tier-bounded consumption * tier
+             rate; appliedUnitRate stored = amount / consumptionUnits (blended,
+             per the earlier decision — no line-item breakdown table)
+      5. insert customer_invoice row
+  - failures for one device (no telemetry that period, no active pricing
+    config, etc.) are caught, logged with deviceId + reason, and skipped —
+    they must NOT abort the whole batch or leave a partial row
+  - re-running for an already-invoiced period is a no-op per device (unique
+    constraint), so the admin-triggered endpoint is safe to call repeatedly
+
+
+5. validation & error handling
+
+  - class-validator DTOs per resource (CreateXDto/UpdateXDto), global
+    ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })
+  - global exception filter normalizes all errors (including TypeORM
+    QueryFailedError, e.g. duplicate-key) to { statusCode, message, error,
+    path, timestamp }; duplicate-key on device_telemetry ingest is treated as
+    a success (idempotent retry), not surfaced as a client error
+  - structured logging (nestjs-pino or built-in Logger with JSON output) —
+    every ingestion request and invoice batch run logs orgId/deviceId context,
+    since these are the two flows most likely to need after-the-fact debugging
+
+
+6. testing
+
+  - unit tests (Jest) only, for now: pricing calculation (FIXED + SLAB,
+    including tier boundaries), opening-checkpoint anchor resolution (incl.
+    the gap/CANCELLED cases), invoice idempotency — these are the parts with
+    real logic worth protecting
+  - e2e/integration tests (supertest) deferred — out of scope for now given
+    time budget, not a correctness gap in the design. Call this out under
+    "what I'd improve with more time" in the README rather than skipping it
+    silently.
+
+
+7. local runnability
+
+  docker-compose.yml:
+    - mysql:8 service
+    - backend service (NestJS, runs migrations on boot, then a seed script)
+    - ingestion-service (NestJS, no migrations of its own — starts after
+      backend's migrations have run, since it depends on the schema existing)
+    - frontend service (React, served via vite preview or nginx)
+
+  seed script creates: one organization, Admin + Customer roles, device_types
+  (METER billed=true, TANK billed=false) with their params, one default
+  pricing_config (FIXED), one admin user — the minimum needed to log in and
+  start creating devices/accounts through the API/UI.
+
+--------------------------------------------------------------------------
+8. frontend — React + JavaScript + Cloudscape
+
+  - plain JavaScript, not TypeScript — TS would be overkill for a prototype
+    UI of this size; the type-safety payoff matters far more on the
+    backend/ingestion-service side (FK-laden entities, migration-generated
+    schema) than on a handful of pages calling a handful of endpoints
+  - UI: Cloudscape Design System components throughout, not a bespoke/ad hoc
+    component set
+  - state: Redux Toolkit slices (not TanStack Query — superseded decision).
+    Server data lives in slices too; loading/error/data state per resource
+  - layered call path, one direction only: Component -> custom hook (e.g.
+    useDevices(), useInvoices()) -> a single API client wrapper -> backend.
+    Components never call the wrapper directly, and the wrapper never
+    contains resource-specific logic — it's the one place that knows about
+    base URL, auth header injection, and error normalization. This
+    single-abstraction-point layering is deliberate for evolvability: the
+    wrapper can change transport (fetch vs axios) or add retry/interceptor
+    behavior without touching hooks or components, and a hook can change how
+    it uses Redux (e.g. add caching/memoization) without touching components
+  - React Router, role-based route guards reading the decoded JWT (redirect
+    to /login on 401 — handled centrally in the API wrapper, not per-hook)
+  - react-hook-form + zod for forms, schemas kept close to the backend DTOs
+    so client-side and server-side validation stay in sync
+  - list-screen search inputs are debounced client-side before calling the
+    `search` query param the backend already supports (Invoice list now,
+    User/Device lists once retrofitted — see task tracking `search`)
+  - token storage: localStorage (reversed from an original in-memory-only
+    design). The token is readable by any injected script for as long as
+    it sits there (up to JWT_EXPIRES_IN, currently 8h) — accepted
+    explicitly so the session survives a page refresh, a usability need
+    that outweighed the XSS-surface tradeoff for this prototype's scope.
+    Call this out in the README as a known limitation: the properly secure
+    fix is an httpOnly cookie + backend refresh-token support, still out of
+    scope (see section 3)
+
+  - role-based visibility is enforced at the page/nav level, not just via
+    route guards redirecting after the fact: which pages exist in
+    navigation and which routes are even reachable is derived from the
+    decoded JWT's roleType at login — a Customer session must never render
+    Admin pages/nav items (and vice versa), not just block the API calls
+    they'd make
+
+  routes/pages:
+    /login
+    Admin:
+      /admin/users            list/create/edit
+      /admin/accounts         list/create, link user
+      /admin/devices          list/create, assign to account, unassigned filter
+      /admin/devices/:id      detail + telemetry chart (time-window picker)
+      /admin/pricing          create/view FIXED or SLAB configs
+      /admin/invoices         list, filter by period/status, trigger generation
+      /admin/invoices/:id     detail, cancel action
+    Customer:
+      /account                own account + linked devices
+      /account/devices/:id    consumption view — chart + time-window picker (req #4)
+      /invoices               current + previous invoices (req #5)
+      /invoices/:id           detail (+ pay action, appreciated #2)
+
+  - consumption view uses a simple line/bar chart (recharts) over
+    GET /devices/:id/telemetry?from=&to=&paramKey= — this is the one place a
+    chart earns its place; everything else is tables/forms
+
+--------------------------------------------------------------------------
+9. build priority ( this is an interview assignment — reviewers weigh judgment
+   and clarity as much as feature count, so sequence accordingly )
+
+  1. required functionality end-to-end, working and testable locally:
+     auth, user/device CRUD, ingestion, consumption view, invoice generation
+  2. README: run instructions, schema explanation, design decisions +
+     assumptions, what you'd improve — this is an explicit deliverable, not
+     an afterthought
+  3. unit tests around the logic that's actually tricky (pricing, checkpoint
+     anchoring, idempotency) — demonstrates rigor without burning time on
+     exhaustive coverage
+  4. appreciated/stretch items (payment gateway, multiple ingestion
+     mechanisms, webhook egress, supply cutoff, e2e tests) — genuinely
+     optional, pick up only what's left after 1–3 are solid, and it's fine to
+     list the rest under "what I'd improve with more time" instead of
+     building them
+
+
+10. open items / assumptions to note in the README
+
+  - FR doesn't explicitly require a frontend UI — building one anyway for a
+    usable "view consumption / view invoices" experience; document this as a
+    deliberate scope addition, not a requirement reinterpretation
+  - no refresh-token flow — access-token-only JWT, session length is a
+    documented tradeoff
+  - no forgot-password flow — a real implementation needs a way to prove
+    identity without the password, which almost always means emailing a
+    reset link/token, and this stack has no email-sending capability at all
+    (unlike payments, which got a mock gateway rather than being skipped —
+    forgot-password was judged lower priority for this assignment's scope
+    and left out entirely rather than half-built). Admin can still create/
+    manage all users, so there's no account-lockout dead end, just no
+    self-service reset
+  - slab pricing stores a blended appliedUnitRate on the invoice, not a
+    line-item-per-tier breakdown (decided earlier — simpler, still auditable
+    via pricingConfigId)
+  - device_command / webhook_subscription (stretch tables) only get built if
+    core scope + tests are solid first
