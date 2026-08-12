@@ -320,47 +320,226 @@ Documented in the data model but not implemented — appreciated/stretch scope, 
 
 ---
 
-## Foreign Key Relationships
+## Entity Relationship Diagrams
+
+Split into three diagrams by domain, so each stays readable as an entity-attribute diagram rather than one large relationship-only graph. `organization` is denormalized onto almost every other table (`orgId`), so it's shown with its full columns once (Identity & Access) and as a minimal PK-only anchor everywhere else — same treatment for any other entity that's the *target* of a cross-domain FK but owned by a different diagram (e.g. `device_type`/`device`/`device_telemetry` reappear as stubs in Billing & Payments). Columns and keys below are verified against the tables above; types are simplified (e.g. `decimal(18,4)` → `decimal`) for diagram readability only — see the per-table sections for exact precision/length.
+
+### Identity & Access
 
 ```mermaid
 erDiagram
-    organization ||--o{ role : "RESTRICT"
-    organization ||--o{ user : "RESTRICT"
-    organization ||--o{ customer_connection : "RESTRICT"
-    organization ||--o{ device_type : "RESTRICT"
-    organization ||--o{ device_type_param : "RESTRICT"
-    organization ||--o{ device : "RESTRICT"
-    organization ||--o{ device_telemetry : "RESTRICT"
-    organization ||--o{ pricing_config : "RESTRICT"
-    organization ||--o{ customer_invoice : "RESTRICT"
-    organization ||--o{ payment_transaction : "RESTRICT"
+    organization {
+        varchar id PK
+        varchar name
+        varchar apiKeySecretHash
+        tinyint isActive
+        datetime createdAt
+        datetime updatedAt
+    }
 
-    role ||--o{ user : "RESTRICT"
+    role {
+        int id PK
+        enum type
+        varchar displayName
+        varchar orgId FK
+    }
 
-    user ||--|| customer_connection : "RESTRICT (1:1)"
+    user {
+        int id PK
+        varchar firstName
+        varchar lastName
+        tinyint isActive
+        varchar email UK
+        varchar phoneNumber
+        varchar passwordHash
+        varchar address
+        varchar pincode
+        varchar orgId FK
+        int roleId FK
+        datetime createdAt
+        datetime updatedAt
+        datetime deletedAt
+    }
 
-    customer_connection |o--o{ device : "RESTRICT (nullable, M:1)"
+    customer_connection {
+        int id PK
+        varchar accountNo
+        int userId FK, UK
+        enum status
+        varchar orgId FK
+        datetime createdAt
+        datetime updatedAt
+        datetime deletedAt
+    }
 
-    device_type ||--o{ device_type_param : "RESTRICT"
-    device_type ||--o{ device : "RESTRICT"
-    device_type ||--o{ device_telemetry : "RESTRICT (denorm)"
-    device_type ||--o{ pricing_config : "RESTRICT"
-
-    device_type_param ||--o{ device_telemetry : "RESTRICT"
-
-    device ||--o{ device_telemetry : "RESTRICT"
-    device ||--o{ customer_invoice : "RESTRICT"
-
-    device_telemetry ||--o{ customer_invoice : "RESTRICT (openingCheckpoint)"
-    device_telemetry ||--o{ customer_invoice : "RESTRICT (closingCheckpoint)"
-
-    pricing_config ||--o{ pricing_slab : "RESTRICT"
-    pricing_config ||--o{ customer_invoice : "RESTRICT"
-
-    customer_invoice ||--o{ payment_transaction : "RESTRICT"
+    organization ||--o{ role : RESTRICT
+    organization ||--o{ user : RESTRICT
+    organization ||--o{ customer_connection : RESTRICT
+    role ||--o{ user : RESTRICT
+    user ||--o| customer_connection : "RESTRICT, 1:1 (optional — not every user has an account)"
 ```
 
-`device_telemetry` relates to `customer_invoice` via two separate foreign keys (`openingCheckpointId`, `closingCheckpointId`), both pointing at the same table — shown above as two edges.
+`role.type` and `device_type.type` etc. use composite uniqueness (`(type, orgId)`), not a standalone `UK` — only columns with a true single-column unique constraint (`user.email`, `customer_connection.userId`) are marked `UK` here; see the per-table **Unique** notes above for the composite ones.
+
+### Device & Telemetry
+
+```mermaid
+erDiagram
+    organization {
+        varchar id PK
+        varchar name
+    }
+
+    customer_connection {
+        int id PK
+    }
+
+    device_type {
+        int id PK
+        enum type
+        tinyint billed
+        varchar orgId FK
+    }
+
+    device_type_param {
+        int id PK
+        int deviceTypeId FK
+        enum paramKey
+        varchar displayName
+        enum dataType
+        varchar orgId FK
+    }
+
+    device {
+        int id PK
+        varchar name
+        varchar serialNo "unique w/ orgId"
+        int deviceTypeId FK
+        int connectionId FK
+        tinyint isActive
+        varchar orgId FK
+        datetime createdAt
+        datetime updatedAt
+        datetime deletedAt
+    }
+
+    device_telemetry {
+        bigint id PK
+        int deviceId FK
+        int deviceTypeId FK
+        int deviceTypeParamId FK
+        decimal value
+        datetime serverTimestamp
+        datetime deviceTimestamp
+        varchar orgId FK
+    }
+
+    organization ||--o{ device_type : RESTRICT
+    organization ||--o{ device_type_param : RESTRICT
+    organization ||--o{ device : RESTRICT
+    organization ||--o{ device_telemetry : RESTRICT
+    device_type ||--o{ device_type_param : RESTRICT
+    device_type ||--o{ device : RESTRICT
+    device_type ||--o{ device_telemetry : "RESTRICT (denorm)"
+    device_type_param ||--o{ device_telemetry : RESTRICT
+    device ||--o{ device_telemetry : RESTRICT
+    customer_connection |o--o{ device : "RESTRICT, nullable — full columns in Identity & Access"
+```
+
+`device_telemetry` has no `createdAt`/`updatedAt` — it's an append-only stream; `serverTimestamp`/`deviceTimestamp` are its only time columns.
+
+### Billing & Payments
+
+```mermaid
+erDiagram
+    organization {
+        varchar id PK
+        varchar name
+    }
+
+    device_type {
+        int id PK
+        enum type
+    }
+
+    device {
+        int id PK
+        varchar serialNo
+    }
+
+    device_telemetry {
+        bigint id PK
+    }
+
+    pricing_config {
+        int id PK
+        int deviceTypeId FK
+        enum rateType
+        decimal fixedRate
+        datetime effectiveFrom
+        datetime effectiveTo
+        varchar orgId FK
+        datetime createdAt
+        datetime updatedAt
+    }
+
+    pricing_slab {
+        int id PK
+        int pricingConfigId FK
+        decimal slabFrom
+        decimal slabTo
+        decimal rate
+    }
+
+    customer_invoice {
+        int id PK
+        varchar serialNo
+        int deviceId FK
+        date billingPeriodStart
+        date billingPeriodEnd
+        bigint openingCheckpointId FK
+        bigint closingCheckpointId FK
+        decimal openingReading
+        decimal closingReading
+        decimal consumptionUnits
+        int pricingConfigId FK
+        decimal appliedUnitRate
+        decimal amount
+        enum status
+        varchar transactionId
+        varchar transactionProvider
+        datetime generatedAt
+        date dueDate
+        varchar orgId FK
+        datetime createdAt
+        datetime updatedAt
+    }
+
+    payment_transaction {
+        int id PK
+        int invoiceId FK
+        varchar provider
+        varchar providerTransactionId
+        decimal amount
+        enum status
+        json rawPayload
+        varchar orgId FK
+        datetime createdAt
+    }
+
+    organization ||--o{ pricing_config : RESTRICT
+    organization ||--o{ customer_invoice : RESTRICT
+    organization ||--o{ payment_transaction : RESTRICT
+    device_type ||--o{ pricing_config : RESTRICT
+    device ||--o{ customer_invoice : RESTRICT
+    device_telemetry ||--o{ customer_invoice : "RESTRICT (openingCheckpoint)"
+    device_telemetry ||--o{ customer_invoice : "RESTRICT (closingCheckpoint)"
+    pricing_config ||--o{ pricing_slab : RESTRICT
+    pricing_config ||--o{ customer_invoice : RESTRICT
+    customer_invoice ||--o{ payment_transaction : RESTRICT
+```
+
+`device_telemetry` relates to `customer_invoice` via two separate foreign keys (`openingCheckpointId`, `closingCheckpointId`), both pointing at the same table — shown above as two edges. `pricing_slab` has no `orgId` column — it's scoped indirectly through `pricingConfigId`, so it isn't a direct `organization` child in this diagram.
 
 ## Indexes
 
