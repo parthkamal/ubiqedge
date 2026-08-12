@@ -17,29 +17,52 @@ import { DeviceType, RateType } from '../../constants/enums';
 // the deeper slab-contiguity business rule (starts at 0, no gaps, only
 // last unbounded) is validated server-side; this only checks types/shape,
 // see PricingService.validateSlabStructure for the authoritative rule
+const slabItemSchema = z.object({
+  slabFrom: z.coerce.number().min(0, 'Must be >= 0'),
+  slabTo: z.union([z.coerce.number().positive(), z.literal('')]).optional(),
+  rate: z.coerce.number().positive('Must be positive'),
+});
+
 const schema = z
   .object({
     type: z.enum([DeviceType.METER, DeviceType.TANK]),
     rateType: z.enum([RateType.FIXED, RateType.SLAB]),
     fixedRate: z.coerce.number().positive('Must be positive').optional(),
-    slabs: z
-      .array(
-        z.object({
-          slabFrom: z.coerce.number().min(0, 'Must be >= 0'),
-          slabTo: z.union([z.coerce.number().positive(), z.literal('')]).optional(),
-          rate: z.coerce.number().positive('Must be positive'),
-        }),
-      )
-      .optional(),
+    // kept loose here on purpose — the placeholder slab row lives in
+    // defaultValues regardless of rateType (react-hook-form's useFieldArray
+    // needs it to exist even while the Slabs UI is hidden), so it must not
+    // be shape-validated unless rateType is actually SLAB (see superRefine)
+    slabs: z.array(z.any()).optional(),
   })
-  .refine((data) => data.rateType !== RateType.FIXED || data.fixedRate !== undefined, {
-    message: 'Fixed rate is required',
-    path: ['fixedRate'],
+  .superRefine((data, ctx) => {
+    if (data.rateType === RateType.FIXED && data.fixedRate === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Fixed rate is required', path: ['fixedRate'] });
+      return;
+    }
+    if (data.rateType === RateType.SLAB) {
+      if (!data.slabs || data.slabs.length === 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'At least one slab is required', path: ['slabs'] });
+        return;
+      }
+      data.slabs.forEach((slab, index) => {
+        const result = slabItemSchema.safeParse(slab);
+        if (!result.success) {
+          for (const issue of result.error.issues) {
+            ctx.addIssue({ ...issue, path: ['slabs', index, ...issue.path] });
+          }
+        }
+      });
+    }
   })
-  .refine((data) => data.rateType !== RateType.SLAB || (data.slabs && data.slabs.length > 0), {
-    message: 'At least one slab is required',
-    path: ['slabs'],
-  });
+  // superRefine only validates — it doesn't transform. Without this, a
+  // passing SLAB submission would still hand submit() the raw (string)
+  // Cloudscape Input values instead of the coerced numbers slabItemSchema
+  // already proved parse cleanly above.
+  .transform((data) =>
+    data.rateType === RateType.SLAB && data.slabs
+      ? { ...data, slabs: data.slabs.map((slab) => slabItemSchema.parse(slab)) }
+      : data,
+  );
 
 const typeOptions = [
   { label: 'Meter', value: DeviceType.METER },
