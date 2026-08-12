@@ -30,10 +30,14 @@ Start these in order — each step depends on the one before it.
 Any MySQL 8 instance works. Example throwaway container:
 
 ```
-docker run -d --name ubiqedge-mysql -p 3306:3306 \
+docker run -d --name ubiqedge-mysql -p 3307:3306 \
   -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=ubiqedge_water_billing \
   mysql:8
 ```
+
+Mapped to host port `3307`, not `3306` — a local MySQL install already bound to `3306`
+is a common conflict. If you use a different host port, set `DB_PORT` in `backend/.env`
+(and `seed/.env`) to match; `backend/.env.example` defaults to `3306`.
 
 ### 2. backend
 
@@ -91,8 +95,22 @@ cp .env.example .env        # points at the backend from step 2 by default
 npm run dev                 # listens on :5173
 ```
 
-Open http://localhost:5173 and log in with the admin credentials `seed.py`
-printed in step 3.
+Open http://localhost:5173 and log in — see **Test credentials** below.
+
+## Test credentials
+
+`seed.py` creates one admin and ten customers, all with fixed (not
+randomly generated) passwords — unlike the ingestion API key, these are
+hardcoded in `seed/seed.py` and reusable across re-runs, so they're safe
+to put here directly rather than making you go dig through the script:
+
+| Role     | Email                              | Password        |
+| -------- | ----------------------------------- | ---------------- |
+| Admin    | `priya.nair@rivergatewater.in`      | `Admin@12345`     |
+| Customer | `anjali.deshpande@gmail.com`        | `Customer@12345`  |
+
+Every other seeded customer (see `seed/seed.py` for the full list) shares
+the same `Customer@12345` password.
 
 ## Known limitations
 
@@ -121,6 +139,29 @@ Deliberate scope decisions, not oversights — full rationale is in
   written per-module for the backend only; everything else was verified
   manually via curl/browser against a live MySQL instance throughout the
   build, not via an automated e2e suite.
+- **Regenerating a cancelled invoice's period isn't instant, and the skip
+  reason can be misread.** Cancelling an invoice doesn't free up its
+  `(deviceId, billingPeriodStart, billingPeriodEnd)` slot — cancelled is a
+  status, not a delete, by design. So retrying generation for that same
+  period hits the DB's unique constraint and is skipped with `"already
+  invoiced for this period"`, which is technically true but easy to
+  misread as "nothing to do here," since the only invoice for that period
+  is in fact cancelled. Nothing is lost: the opening checkpoint always
+  anchors to the last **non-cancelled** invoice, so that consumption gets
+  picked up automatically the next time generation runs for a
+  later-ending period — no special "reissue" action needed or provided.
+- **No proration across a pricing change mid-period.** Invoice generation
+  looks up whichever pricing config is active *at generation time*
+  (`effectiveTo IS NULL`), not whatever was active during the billing
+  period itself. In the common case (generate promptly, config unchanged
+  since) these are the same thing. But if the config changes mid-period —
+  or a cancelled invoice causes the next one to span multiple months (see
+  above) — the entire consumption is billed at whichever rate happens to
+  be active when the job runs, not split across the change. Proration
+  would need per-day consumption data this system doesn't have (only
+  cumulative checkpoint readings), so it's left undone rather than
+  half-built; `pricingConfigId` is still recorded on every invoice for
+  audit purposes either way.
 
 ## Scaling Strategy
 
