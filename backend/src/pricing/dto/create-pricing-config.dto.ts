@@ -22,6 +22,7 @@ export class CreatePricingConfigDto {
   rateType: RateType;
 
   @ValidateIf((dto: CreatePricingConfigDto) => dto.rateType === RateType.FIXED)
+  @Type(() => Number)
   @IsNumber()
   @IsPositive()
   fixedRate?: number;
