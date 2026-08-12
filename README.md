@@ -112,6 +112,13 @@ to put here directly rather than making you go dig through the script:
 Every other seeded customer (see `seed/seed.py` for the full list) shares
 the same `Customer@12345` password.
 
+## Endpoints
+
+- **Frontend**: http://localhost:5173
+- **Backend API**: http://localhost:3000/api/v1
+- **Swagger (backend API docs)**: http://localhost:3000/api/docs
+- **Ingestion service**: http://localhost:3001/ingest/v1
+
 ## Known limitations
 
 Deliberate scope decisions, not oversights — full rationale is in
