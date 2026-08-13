@@ -150,4 +150,43 @@ describe('TelemetryService', () => {
       expect(where.deviceTypeParamId).toBe(42);
     });
   });
+
+  // regression coverage for the "1 day range still shows stale data" bug:
+  // a range with more readings than `limit` must keep the *newest* ones,
+  // not silently truncate to the oldest slice of the window — see
+  // feedback_readme_scaling_discussion-adjacent conversation, telemetry fix.
+  describe('newest-first selection, chronological response order', () => {
+    it('selects with DESC order so LIMIT captures the most recent readings, not the oldest', async () => {
+      await service.findForDevice(10, { page: 1, limit: 500 }, currentUser);
+
+      const options = telemetryRepository.findAndCount.mock.calls[0][0];
+      expect(options.order).toEqual({ deviceTimestamp: 'DESC' });
+    });
+
+    it('reverses the newest-first page back to chronological order before returning it', async () => {
+      // repository returns newest-first (as DESC order would), the service
+      // must hand back oldest-first for the chart's x-axis to render correctly
+      const newestFirst = [
+        { id: 3, value: '30', deviceTimestamp: new Date('2026-08-13T09:00:00Z'), deviceTypeParam: { paramKey: ParamKey.TOTAL } },
+        { id: 2, value: '20', deviceTimestamp: new Date('2026-08-13T08:00:00Z'), deviceTypeParam: { paramKey: ParamKey.TOTAL } },
+        { id: 1, value: '10', deviceTimestamp: new Date('2026-08-13T07:00:00Z'), deviceTypeParam: { paramKey: ParamKey.TOTAL } },
+      ];
+      telemetryRepository.findAndCount.mockResolvedValue([newestFirst, 3]);
+
+      const result = await service.findForDevice(10, { page: 1, limit: 500 }, currentUser);
+
+      expect(result.data.map((r) => r.value)).toEqual(['10', '20', '30']);
+      expect(result.data[0].deviceTimestamp).toEqual(new Date('2026-08-13T07:00:00Z'));
+      expect(result.data[result.data.length - 1].deviceTimestamp).toEqual(new Date('2026-08-13T09:00:00Z'));
+    });
+
+    it('page 2 continues further into the past, not further into the future', async () => {
+      await service.findForDevice(10, { page: 2, limit: 500 }, currentUser);
+
+      const options = telemetryRepository.findAndCount.mock.calls[0][0];
+      expect(options.order).toEqual({ deviceTimestamp: 'DESC' });
+      expect(options.skip).toBe(500);
+      expect(options.take).toBe(500);
+    });
+  });
 });

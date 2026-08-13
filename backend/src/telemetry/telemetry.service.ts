@@ -62,17 +62,24 @@ export class TelemetryService {
       where.deviceTypeParamId = deviceTypeParam.id;
     }
 
-    const [readings, total] = await this.telemetryRepository.findAndCount({
+    // selection is newest-first — page 1 is "now, going backwards" — so a
+    // range with more readings than `limit` keeps the most recent ones
+    // instead of silently truncating to the oldest slice of the window.
+    // The page itself is then reversed back to chronological order before
+    // returning, since a line chart needs ascending order to render
+    // left-to-right; only the *selection* direction is newest-first.
+    const [rowsNewestFirst, total] = await this.telemetryRepository.findAndCount({
       // only the columns the response DTO actually uses (id is required by
       // TypeORM's own DISTINCT-pagination subquery when relations + skip/take
       // are combined — it's never exposed by TelemetryReadingDto.fromEntity)
       select: { id: true, value: true, deviceTimestamp: true, deviceTypeParam: { paramKey: true } },
       where,
       relations: { deviceTypeParam: true },
-      order: { deviceTimestamp: 'ASC' },
+      order: { deviceTimestamp: 'DESC' },
       skip: (query.page - 1) * query.limit,
       take: query.limit,
     });
+    const readings = rowsNewestFirst.reverse();
 
     return {
       data: readings.map((r) => TelemetryReadingDto.fromEntity(r)),
